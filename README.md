@@ -1,1 +1,156 @@
-# mini-nginx
+# Mini-Nginx на asyncio
+
+reverse proxy для HTTP/1.1, написанный на `asyncio`
+
+## Текущее состояние
+
+Уже реализовано:
+
+- приём TCP-соединений;
+- минимальный парсинг стартовой строки и заголовков HTTP-запроса;
+- потоковая передача тела запроса без полной загрузки в память;
+- потоковая передача ответа upstream клиенту;
+- backpressure через `await writer.drain()`;
+- round-robin между несколькими upstream;
+- лимит клиентских соединений и соединений к каждому upstream;
+- connect/read/write/total таймауты;
+- YAML-конфигурация;
+- клиентский HTTP keep-alive;
+- парсинг заголовков ответа и логирование HTTP-статуса;
+- структурированные логи через `structlog`;
+- минимальные счётчики и таймеры;
+- нагрузочное тестирование через k6.
+
+Переиспользование TCP-соединений к upstream пока не реализовано: для каждого
+HTTP-запроса proxy открывает отдельное upstream-соединение.
+
+## Структура проекта
+
+```text
+proxy/
+  main.py             точка запуска приложения
+  config.py           модели конфигурации и загрузка YAML
+  config.yml          адрес proxy, upstream, таймауты и лимиты
+  proxy_server.py     TCP-сервер и лимит клиентских соединений
+  client_handler.py   обработка и проксирование HTTP-запроса
+  upstream_pool.py    round-robin и лимит запросов к upstream
+  timeouts.py         перевод таймаутов из миллисекунд в секунды
+  metrics.py          состояние минимальных метрик
+  utils/
+    http.py           минимальные HTTP request/response head
+    logs.py           настройка логирования
+tests/
+  echo_app.py         тестовый upstream на FastAPI
+  load_test.js        сценарии k6
+  load_scenarios.md   запуск и разбор нагрузочных тестов
+```
+
+`UpstreamPool` сейчас является пулом доступности, а не пулом TCP-соединений.
+Он выбирает upstream по round-robin и удерживает его `Semaphore` на время
+обработки запроса.
+
+## Как проходит запрос
+
+1. `ProxyServer` принимает TCP-соединение клиента.
+2. Клиент занимает место в `max_client_conns`.
+3. `HttpRequestHead` читает стартовую строку и заголовки до пустой строки.
+4. `UpstreamPool` выбирает upstream по round-robin и захватывает его семафор.
+5. Proxy открывает TCP-соединение к выбранному upstream.
+6. Заголовки и тело запроса отправляются upstream.
+7. Ответ сразу передаётся клиенту кусками по мере получения.
+8. Вызов `writer.drain()` не позволяет бесконечно складывать данные в буфер,
+   если получатель читает медленнее отправителя.
+9. В `finally` задачи отменяются, а открытые соединения закрываются.
+
+Сетевые операции являются IO-bound. Пока корутина ожидает данные сокета,
+event loop может обслуживать другие соединения в том же потоке.
+
+## Конфигурация
+
+Пример [proxy/config.yml](./proxy/config.yml):
+
+```yaml
+listen: "127.0.0.1:8090"
+upstreams:
+  - host: "127.0.0.1"
+    port: 9002
+  - host: "127.0.0.1"
+    port: 9003
+timeouts:
+  connect_ms: 1000
+  read_ms: 15000
+  write_ms: 15000
+  total_ms: 30000
+limits:
+  max_client_conns: 1000
+  max_conns_per_upstream: 100
+```
+
+Таймауты задаются в миллисекундах, а `TimeoutPolicy` переводит их в секунды,
+которые ожидает `asyncio.wait_for`.
+
+## Локальный запуск
+
+Установить зависимости:
+
+```bash
+uv sync
+```
+
+Запустить первый upstream:
+
+```bash
+INSTANCE_ID=upstream-1 uv run uvicorn tests.echo_app:app \
+  --host 127.0.0.1 --port 9002
+```
+
+Во втором терминале запустить второй upstream:
+
+```bash
+INSTANCE_ID=upstream-2 uv run uvicorn tests.echo_app:app \
+  --host 127.0.0.1 --port 9003
+```
+
+В третьем терминале запустить proxy:
+
+```bash
+uv run -m proxy.main
+```
+
+Проверить GET и POST:
+
+```bash
+curl -v http://127.0.0.1:8090/
+curl -v -X POST http://127.0.0.1:8090/echo -d 'hello world'
+```
+
+При последовательных запросах ответы должны по очереди содержать
+`upstream-1` и `upstream-2`.
+
+## Нагрузочное тестирование
+
+Тесты запускаются в Docker-образе k6:
+
+```bash
+TEST_TYPE=smoke ./run_k6.sh
+TEST_TYPE=load ./run_k6.sh
+TEST_TYPE=stress ./run_k6.sh
+TEST_TYPE=keepalive ./run_k6.sh
+TEST_TYPE=timeout ./run_k6.sh
+```
+
+Подробное назначение сценариев, ожидаемые результаты и порядок проведения
+тестов описаны в [tests/load_scenarios.md](tests/load_scenarios.md).
+
+## Границы минимальной HTTP-поддержки
+
+Проект сознательно не реализует всю спецификацию HTTP/1.1. На этапе MVP:
+
+- тело запроса определяется по `Content-Length`;
+- chunked request body не поддерживается;
+- HTTPS/TLS не поддерживается;
+- upgrade до WebSocket не поддерживается;
+- health-check, retry и circuit breaker оставлены на следующие этапы;
+- полноценная очистка всех hop-by-hop заголовков пока не реализована.
+
+Эти ограничения следует учитывать при интерпретации нагрузочных тестов.
