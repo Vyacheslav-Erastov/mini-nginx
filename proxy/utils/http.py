@@ -162,6 +162,27 @@ class HttpResponseHead:
             headers=headers,
         )
 
+    @property
+    def content_length(self) -> int:
+        value = self.get_header("content-length")
+
+        if value is None:
+            return 0
+
+        return int(value)
+
+    @property
+    def keep_alive(self) -> bool:
+        connection = self.get_header(
+            "connection",
+            "",
+        ).lower()
+
+        if self.version == "HTTP/1.1":
+            return connection != "close"
+
+        return connection == "keep-alive"
+
     def get_header(
         self,
         name: str,

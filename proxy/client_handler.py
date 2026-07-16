@@ -3,7 +3,7 @@ from asyncio.streams import StreamReader, StreamWriter
 from dataclasses import dataclass
 from time import perf_counter
 
-from proxy.config import Config, Upstream
+from proxy.config import Config
 from proxy.metrics import Metrics
 from proxy.timeouts import TimeoutPolicy
 from proxy.upstream_pool import UpstreamPool
@@ -16,12 +16,13 @@ logger = logs.get_logger(__name__)
 @dataclass
 class RequestResult:
     body_size: int
+    keep_client_connection: bool
 
 
 @dataclass
 class ResponseResult:
     status_code: int
-    keep_connection: bool
+    keep_upstream_coonnection: bool
     body_size: int
 
 
@@ -87,10 +88,7 @@ class ClientHandler:
         request: HttpRequestHead,
     ) -> tuple[int, int, bool]:
 
-        request.set_header(
-            "connection",
-            "close",
-        )
+        keep_client_connection = request.keep_alive
 
         upstream_writer.write(bytes(request))
 
@@ -105,13 +103,15 @@ class ClientHandler:
             bytes_to_read=request.content_length,
         )
 
-        return RequestResult(body_size=body_size)
+        return RequestResult(
+            body_size=body_size, keep_client_connection=keep_client_connection
+        )
 
     async def _stream_response_to_client(
         self,
         upstream_reader: StreamReader,
         client_writer: StreamWriter,
-        is_client_keep_alive: bool,
+        keep_client_connection: bool,
     ) -> tuple[int, int, bool]:
 
         response = await asyncio.wait_for(
@@ -119,9 +119,11 @@ class ClientHandler:
             timeout=self.timeout_policy.read,
         )
 
+        keep_upstream_connection = response.keep_alive
+
         response.set_header(
             "connection",
-            ("keep-alive" if is_client_keep_alive else "close"),
+            ("keep-alive" if keep_client_connection else "close"),
         )
 
         client_writer.write(bytes(response))
@@ -134,12 +136,12 @@ class ClientHandler:
         body_size = await self._stream_reader_to_writer(
             reader=upstream_reader,
             writer=client_writer,
-            bytes_to_read=None,
+            bytes_to_read=response.content_length,
         )
 
         return ResponseResult(
             status_code=response.status_code,
-            keep_connection=is_client_keep_alive,
+            keep_upstream_coonnection=keep_upstream_connection,
             body_size=body_size,
         )
 
@@ -147,22 +149,14 @@ class ClientHandler:
         self,
         client_reader: StreamReader,
         client_writer: StreamWriter,
-        upstream: Upstream,
+        upstream_reader: StreamReader,
+        upstream_writer: StreamWriter,
         request: HttpRequestHead,
     ) -> ProxyResult:
-        upstream_writer: StreamWriter | None = None
         stream_tasks: list[asyncio.Task] = []
 
         try:
-            is_client_keep_alive = request.keep_alive
-
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    host=upstream.host,
-                    port=upstream.port,
-                ),
-                timeout=self.timeout_policy.connect,
-            )
+            keep_client_connection = request.keep_alive
 
             request_to_upstream = asyncio.create_task(
                 self._stream_request_to_upstream(
@@ -176,7 +170,7 @@ class ClientHandler:
                 self._stream_response_to_client(
                     upstream_reader=upstream_reader,
                     client_writer=client_writer,
-                    is_client_keep_alive=is_client_keep_alive,
+                    keep_client_connection=keep_client_connection,
                 )
             )
 
@@ -200,21 +194,25 @@ class ClientHandler:
                     return_exceptions=True,
                 )
 
-            await self._close_writer(upstream_writer)
-
     async def handle_client(
         self, client_reader: StreamReader, client_writer: StreamWriter
     ):
         try:
             while True:
-                async with self.upstream_pool.get_upstream() as upstream:
-                    try:
-                        request: HttpRequestHead = await asyncio.wait_for(
-                            HttpRequestHead.from_reader(client_reader),
-                            timeout=self.timeout_policy.read,
-                        )
+                started_at = perf_counter()
+                try:
+                    request: HttpRequestHead = await asyncio.wait_for(
+                        HttpRequestHead.from_reader(client_reader),
+                        timeout=self.timeout_policy.read,
+                    )
+                except ConnectionError:
+                    break
 
-                        started_at = perf_counter()
+                async with self.upstream_pool.get_connection() as (
+                    upstream,
+                    connection,
+                ):
+                    try:
                         upstream_address = f"{upstream.host}:{upstream.port}"
 
                         request_logger = logger.bind(
@@ -230,11 +228,19 @@ class ClientHandler:
 
                         request_logger.info("request_started")
 
-                        result = await asyncio.wait_for(
+                        result: ProxyResult = await asyncio.wait_for(
                             self._proxy_request(
-                                client_reader, client_writer, upstream, request
+                                client_reader,
+                                client_writer,
+                                connection.reader,
+                                connection.writer,
+                                request,
                             ),
                             timeout=self.timeout_policy.total,
+                        )
+
+                        connection.reusable = (
+                            result.response_result.keep_upstream_coonnection
                         )
 
                         self.metrics.request_completed(
@@ -288,7 +294,7 @@ class ClientHandler:
                             duration_seconds=perf_counter() - started_at,
                         )
 
-                    if not result.response_result.keep_connection:
+                    if not result.request_result.keep_client_connection:
                         break
 
         except asyncio.CancelledError:

@@ -18,7 +18,7 @@ class ProxyServer:
         self.server: asyncio.Server | None = None
         self.timeout_policy = TimeoutPolicy.from_config(config.timeouts)
         self.client_semaphore = asyncio.Semaphore(config.limits.max_client_conns)
-        upstream_pool = UpstreamPool(config)
+        upstream_pool = UpstreamPool(config, timeout_policy=self.timeout_policy)
         self.metrics = Metrics()
         self.client_handler = ClientHandler(
             config=config,
@@ -65,6 +65,7 @@ class ProxyServer:
                 client_address=address,
             )
         finally:
+            self.metrics.client_disconnected()
             logger.info(
                 "client_disconnected",
                 client_address=address,
