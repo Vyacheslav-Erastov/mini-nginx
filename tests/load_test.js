@@ -55,8 +55,8 @@ const profiles = {
         exec: "regularTraffic",
         stages: [
           { duration: "10s", target: 50 },
-          { duration: "15s", target: 100 },
-          { duration: "15s", target: 200 },
+          { duration: "15s", target: 1000 },
+          { duration: "70s", target: 1000 },
           { duration: "15s", target: 200 },
           { duration: "5s", target: 0 },
         ],
